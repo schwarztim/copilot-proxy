@@ -1,0 +1,82 @@
+#!/bin/bash
+# Launch claude-cli routed through GitHub Copilot's API
+# Starts the copilot-proxy if not already running, seeds onboarding
+# bypass config, then launches the real claude binary.
+
+set -euo pipefail
+
+PROXY_PORT="${COPILOT_PROXY_PORT:-4141}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+CLAUDE_BIN="/opt/homebrew/bin/claude"
+API_KEY="sk-ant-copilot-proxy-not-a-real-key"
+CLAUDE_CONFIG_DIR="$HOME/.claude"
+# Claude reads .config.json first (if it exists), then falls back to .claude.json
+CLAUDE_CONFIG="$CLAUDE_CONFIG_DIR/.config.json"
+CLAUDE_CONFIG_ALT="$CLAUDE_CONFIG_DIR/.claude.json"
+
+export ANTHROPIC_BASE_URL="http://localhost:$PROXY_PORT"
+export ANTHROPIC_API_KEY="$API_KEY"
+
+# --- Start proxy as a proper daemon (survives shell exit) ---
+if ! curl -s "http://localhost:$PROXY_PORT/health" >/dev/null 2>&1; then
+  echo "Starting copilot-proxy on port $PROXY_PORT..."
+  # Start detached: nohup + background + disown survives shell exit
+  nohup node "$SCRIPT_DIR/proxy.mjs" > /tmp/copilot-proxy.log 2>&1 &
+  disown $! 2>/dev/null
+  for i in $(seq 1 10); do
+    curl -s "http://localhost:$PROXY_PORT/health" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  if ! curl -s "http://localhost:$PROXY_PORT/health" >/dev/null 2>&1; then
+    echo "❌ Proxy failed to start. Check /tmp/copilot-proxy.log"
+    exit 1
+  fi
+  echo "✅ Proxy running"
+fi
+
+# --- Seed onboarding bypass so interactive mode skips the wizard ---
+# Claude checks hasCompletedOnboarding + theme + API key approval.
+# It reads .config.json first (if exists), so we must seed THAT file.
+seed_config() {
+  local f="$1"
+  if [ ! -f "$f" ]; then return; fi
+  local needs=false
+  grep -q '"hasCompletedOnboarding": true' "$f" 2>/dev/null || needs=true
+  grep -q '"proxy-not-a-real-key"' "$f" 2>/dev/null || needs=true
+  if [ "$needs" = true ]; then
+    node -e "
+      const fs = require('fs');
+      const f = '$f';
+      const c = JSON.parse(fs.readFileSync(f, 'utf8'));
+      c.hasCompletedOnboarding = true;
+      c.theme = c.theme || 'dark';
+      c.lastOnboardingVersion = '2.1.56';
+      if (!c.customApiKeyResponses) c.customApiKeyResponses = {};
+      if (!c.customApiKeyResponses.approved) c.customApiKeyResponses.approved = [];
+      const hash = 'proxy-not-a-real-key';
+      if (!c.customApiKeyResponses.approved.includes(hash))
+        c.customApiKeyResponses.approved.push(hash);
+      fs.writeFileSync(f, JSON.stringify(c, null, 2) + '\n');
+    "
+  fi
+}
+
+# Seed both config files (claude reads .config.json first if it exists)
+if [ -f "$CLAUDE_CONFIG" ]; then
+  seed_config "$CLAUDE_CONFIG"
+fi
+if [ -f "$CLAUDE_CONFIG_ALT" ]; then
+  seed_config "$CLAUDE_CONFIG_ALT"
+fi
+# If neither exists, create .config.json with minimal config
+if [ ! -f "$CLAUDE_CONFIG" ] && [ ! -f "$CLAUDE_CONFIG_ALT" ]; then
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  echo '{
+  "hasCompletedOnboarding": true,
+  "theme": "dark",
+  "lastOnboardingVersion": "2.1.56",
+  "customApiKeyResponses": { "approved": ["proxy-not-a-real-key"] }
+}' > "$CLAUDE_CONFIG"
+fi
+
+exec "$CLAUDE_BIN" "$@"

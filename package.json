@@ -1,0 +1,36 @@
+{
+  "name": "copilot-proxy",
+  "version": "1.0.0",
+  "description": "Localhost proxy that lets Claude Code use your GitHub Copilot subscription — translates Anthropic Messages API to OpenAI Chat Completions format",
+  "main": "proxy.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node proxy.mjs",
+    "dev": "node proxy.mjs --verbose"
+  },
+  "bin": {
+    "copilot-proxy": "./proxy.mjs"
+  },
+  "keywords": [
+    "github-copilot",
+    "claude",
+    "claude-code",
+    "anthropic",
+    "openai",
+    "proxy",
+    "api-translation"
+  ],
+  "author": "Timothy Schwarz",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/schwarztim/copilot-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/schwarztim/copilot-proxy/issues"
+  },
+  "homepage": "https://github.com/schwarztim/copilot-proxy#readme"
+}
