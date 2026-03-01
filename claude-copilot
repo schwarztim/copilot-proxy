@@ -17,12 +17,12 @@ CLAUDE_CONFIG_ALT="$CLAUDE_CONFIG_DIR/.claude.json"
 export ANTHROPIC_BASE_URL="http://localhost:$PROXY_PORT"
 export ANTHROPIC_API_KEY="$API_KEY"
 
-# --- Start proxy as a proper daemon (survives shell exit) ---
+# --- Ensure proxy is running via launchd (singleton, auto-restart, survives logout) ---
 if ! curl -s "http://localhost:$PROXY_PORT/health" >/dev/null 2>&1; then
   echo "Starting copilot-proxy on port $PROXY_PORT..."
-  # Start detached: nohup + background + disown survives shell exit
-  nohup node "$SCRIPT_DIR/proxy.mjs" > /tmp/copilot-proxy.log 2>&1 &
-  disown $! 2>/dev/null
+  # Load the launchd agent if not already loaded
+  launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.copilot.proxy.plist" 2>/dev/null \
+    || launchctl kickstart -k "gui/$(id -u)/com.copilot.proxy" 2>/dev/null
   for i in $(seq 1 10); do
     curl -s "http://localhost:$PROXY_PORT/health" >/dev/null 2>&1 && break
     sleep 0.5
@@ -31,7 +31,7 @@ if ! curl -s "http://localhost:$PROXY_PORT/health" >/dev/null 2>&1; then
     echo "❌ Proxy failed to start. Check /tmp/copilot-proxy.log"
     exit 1
   fi
-  echo "✅ Proxy running"
+  echo "✅ Proxy running (launchd managed)"
 fi
 
 # --- Seed onboarding bypass so interactive mode skips the wizard ---
