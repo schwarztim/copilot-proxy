@@ -273,8 +273,34 @@ function anthropicToOpenAI(body) {
     }
   }
 
-  // Messages
-  for (const msg of body.messages || []) {
+  // Messages — handle compaction blocks (drop everything before them)
+  const rawMessages = body.messages || [];
+  let startIdx = 0;
+  let compactionSummary = null;
+
+  // Scan for the last compaction block — everything before it gets dropped
+  for (let i = rawMessages.length - 1; i >= 0; i--) {
+    const msg = rawMessages[i];
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block.type === "compaction") {
+        startIdx = i;
+        compactionSummary = block.content;
+        break;
+      }
+    }
+    if (compactionSummary) break;
+  }
+
+  // If a compaction block was found, inject the summary as a user context message
+  if (compactionSummary) {
+    messages.push({
+      role: "user",
+      content: `<context>\nThe following is a summary of our conversation so far:\n\n${compactionSummary}\n</context>`,
+    });
+  }
+
+  for (const msg of rawMessages.slice(startIdx)) {
     const role = msg.role === "assistant" ? "assistant" : "user";
 
     if (typeof msg.content === "string") {
@@ -328,6 +354,9 @@ function anthropicToOpenAI(body) {
         case "thinking":
           // Pass thinking as a system-like annotation
           parts.push(`<thinking>${block.thinking}</thinking>`);
+          break;
+        case "compaction":
+          // Already handled above — skip
           break;
       }
     }
@@ -639,6 +668,14 @@ async function handleMessages(req, res) {
   }
 
   const requestModel = anthropicReq.model || "claude-sonnet-4.6";
+
+  // Extract compaction config before translation
+  const compactionConfig = extractCompactionConfig(anthropicReq);
+  if (compactionConfig) {
+    delete anthropicReq.context_management;
+    log(`Compaction enabled: trigger=${compactionConfig.triggerTokens}, pause=${compactionConfig.pauseAfter}`);
+  }
+
   const openaiReq = anthropicToOpenAI(anthropicReq);
   const openaiBody = JSON.stringify(openaiReq);
 
@@ -649,6 +686,33 @@ async function handleMessages(req, res) {
   }
 
   try {
+    // Check if compaction should trigger
+    if (compactionConfig) {
+      const estimatedTokens = estimateTokens(openaiReq.messages);
+      log(`Token estimate: ~${estimatedTokens} (threshold: ${compactionConfig.triggerTokens})`);
+
+      if (estimatedTokens >= compactionConfig.triggerTokens) {
+        log("Compaction threshold exceeded — triggering summarization");
+        const compactionResult = await performCompaction(
+          openaiReq.messages,
+          requestModel,
+          compactionConfig.instructions,
+          token
+        );
+
+        if (compactionResult) {
+          return sendCompactionResponse(
+            res,
+            requestModel,
+            compactionResult,
+            compactionConfig,
+            openaiReq.stream,
+            openaiReq.messages
+          );
+        }
+        log("Compaction failed, proceeding with normal request");
+      }
+    }
     const upstream = await proxyRequest(
       "POST",
       "/chat/completions",
@@ -803,6 +867,183 @@ server.listen(PORT, "127.0.0.1", async () => {
 └─────────────────────────────────────────────────┘
 `);
 });
+
+// ─── Compaction ─────────────────────────────────────────────────────────────
+
+const DEFAULT_COMPACTION_TRIGGER = 150_000;
+const MIN_COMPACTION_TRIGGER = 50_000;
+
+const DEFAULT_COMPACTION_INSTRUCTIONS = `Please provide a detailed summary of the conversation so far. Focus on:
+1. Key decisions made and their rationale
+2. Current state of any tasks in progress
+3. Important code changes, file paths, and technical details
+4. Any unresolved questions or next steps
+Preserve specific details like file paths, function names, error messages, and configuration values that would be needed to continue the work.`;
+
+function extractCompactionConfig(body) {
+  const edits = body.context_management?.edits;
+  if (!Array.isArray(edits)) return null;
+
+  const compact = edits.find((e) => e.type === "compact_20260112");
+  if (!compact) return null;
+
+  const triggerTokens = Math.max(
+    compact.trigger?.value || DEFAULT_COMPACTION_TRIGGER,
+    MIN_COMPACTION_TRIGGER
+  );
+
+  return {
+    triggerTokens,
+    pauseAfter: compact.pause_after_compaction ?? true,
+    instructions: compact.instructions || DEFAULT_COMPACTION_INSTRUCTIONS,
+  };
+}
+
+function estimateTokens(openaiMessages) {
+  return Math.ceil(JSON.stringify(openaiMessages).length / 4);
+}
+
+function sendCompactionResponse(res, requestModel, compactionResult, config, isStreaming, originalMessages) {
+  const msgId = `msg_${Date.now().toString(36)}`;
+  const compactionUsage = compactionResult.usage;
+
+  if (isStreaming) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    // message_start
+    sendSSE(res, "message_start", {
+      type: "message_start",
+      message: {
+        id: msgId,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: requestModel,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: compactionUsage.input_tokens, output_tokens: 0 },
+      },
+    });
+
+    // compaction content block
+    sendSSE(res, "content_block_start", {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "compaction", content: "" },
+    });
+
+    sendSSE(res, "content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "compaction_delta", content: compactionResult.summary },
+    });
+
+    sendSSE(res, "content_block_stop", {
+      type: "content_block_stop",
+      index: 0,
+    });
+
+    // message_delta with stop reason
+    const stopReason = config.pauseAfter ? "compaction" : "end_turn";
+    sendSSE(res, "message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: compactionUsage.output_tokens },
+    });
+
+    sendSSE(res, "message_stop", { type: "message_stop" });
+    res.end();
+  } else {
+    const stopReason = config.pauseAfter ? "compaction" : "end_turn";
+    const anthropicResp = {
+      id: msgId,
+      type: "message",
+      role: "assistant",
+      content: [{ type: "compaction", content: compactionResult.summary }],
+      model: requestModel,
+      stop_reason: stopReason,
+      stop_sequence: null,
+      usage: {
+        input_tokens: compactionUsage.input_tokens,
+        output_tokens: compactionUsage.output_tokens,
+        iterations: [
+          {
+            type: "compaction",
+            input_tokens: compactionUsage.input_tokens,
+            output_tokens: compactionUsage.output_tokens,
+          },
+        ],
+      },
+    };
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(anthropicResp));
+  }
+
+  log(`Compaction response sent (stop_reason=${config.pauseAfter ? "compaction" : "end_turn"})`);
+}
+
+async function performCompaction(messages, model, instructions, token) {
+  const summaryMessages = [
+    { role: "system", content: instructions },
+    ...messages,
+    {
+      role: "user",
+      content:
+        "Please summarize the entire conversation above according to the instructions in the system prompt.",
+    },
+  ];
+
+  const summaryReq = JSON.stringify({
+    model: mapModel(model),
+    messages: summaryMessages,
+    stream: false,
+    max_tokens: 8192,
+  });
+
+  log(`Compaction: sending summarization request (${summaryMessages.length} msgs)`);
+
+  const upstream = await proxyRequest(
+    "POST",
+    "/chat/completions",
+    {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "Copilot-Integration-Id": INTEGRATION_ID,
+      "Editor-Version": "copilot-proxy/1.0.0",
+      "Content-Length": Buffer.byteLength(summaryReq),
+    },
+    summaryReq
+  );
+
+  let respBody = "";
+  for await (const chunk of upstream) respBody += chunk;
+
+  if (upstream.statusCode !== 200) {
+    log(`Compaction summarization failed: ${upstream.statusCode} ${respBody}`);
+    return null;
+  }
+
+  const resp = JSON.parse(respBody);
+  const summary = resp.choices?.[0]?.message?.content;
+  if (!summary) {
+    log("Compaction: no summary content in response");
+    return null;
+  }
+
+  log(`Compaction: got summary (${summary.length} chars)`);
+  return {
+    summary,
+    usage: {
+      input_tokens: resp.usage?.prompt_tokens || 0,
+      output_tokens: resp.usage?.completion_tokens || 0,
+    },
+  };
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
