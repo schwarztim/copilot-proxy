@@ -35,6 +35,9 @@ const GITHUB_CLIENT_ID = "Iv1.b507a08c87ecfe98";
 // ─── Token Management ───────────────────────────────────────────────────────
 
 let cachedToken = null;
+// Track ratio of actual prompt_tokens to estimated tokens for calibration
+let tokenCalibrationRatio = 1.0;
+let tokenCalibrationSamples = 0;
 
 function loadToken() {
   // 1. Environment variable override
@@ -617,6 +620,7 @@ function streamOpenAIToAnthropic(res, requestModel, requestId) {
     },
 
     stopReason: "end_turn",
+    get usage() { return usage; },
   };
 }
 
@@ -669,12 +673,43 @@ async function handleMessages(req, res) {
 
   const requestModel = anthropicReq.model || "claude-sonnet-4.6";
 
-  // Extract compaction config before translation
-  const compactionConfig = extractCompactionConfig(anthropicReq);
+  // Debug: log request structure to diagnose compaction
+  if (VERBOSE) {
+    const reqKeys = Object.keys(anthropicReq).join(", ");
+    log(`Request keys: [${reqKeys}]`);
+    if (anthropicReq.context_management) {
+      log(`context_management: ${JSON.stringify(anthropicReq.context_management)}`);
+    } else {
+      log("No context_management in request");
+    }
+    // Log beta headers
+    const betaHeader = req.headers["anthropic-beta"] || req.headers["x-anthropic-beta"];
+    if (betaHeader) log(`anthropic-beta header: ${betaHeader}`);
+    // Log message count and estimated size
+    const msgCount = anthropicReq.messages?.length || 0;
+    const rawSize = rawBody.length;
+    log(`Messages: ${msgCount}, raw body size: ${rawSize} bytes (~${Math.ceil(rawSize/4)} est tokens)`);
+  }
+
+  // Extract compaction config from request, or use proxy defaults
+  let compactionConfig = extractCompactionConfig(anthropicReq);
   if (compactionConfig) {
     delete anthropicReq.context_management;
-    log(`Compaction enabled: trigger=${compactionConfig.triggerTokens}, pause=${compactionConfig.pauseAfter}`);
+    log(`Compaction config from client: trigger=${compactionConfig.triggerTokens}, pause=${compactionConfig.pauseAfter}`);
+  } else {
+    // Claude Code doesn't send compact_20260112 through this proxy —
+    // inject proxy-side compaction with per-model thresholds (~65-70% of context)
+    const mappedModel = mapModel(requestModel);
+    const trigger = MODEL_COMPACTION_TRIGGERS[mappedModel] || DEFAULT_COMPACTION_TRIGGER;
+    compactionConfig = {
+      triggerTokens: trigger,
+      pauseAfter: true,
+      instructions: DEFAULT_COMPACTION_INSTRUCTIONS,
+    };
+    if (VERBOSE) log(`Using proxy-side compaction: model=${mappedModel}, trigger=${trigger}`);
   }
+  // Strip context_management regardless (Copilot doesn't understand it)
+  delete anthropicReq.context_management;
 
   const openaiReq = anthropicToOpenAI(anthropicReq);
   const openaiBody = JSON.stringify(openaiReq);
@@ -688,7 +723,7 @@ async function handleMessages(req, res) {
   try {
     // Check if compaction should trigger
     if (compactionConfig) {
-      const estimatedTokens = estimateTokens(openaiReq.messages);
+      const estimatedTokens = estimateTokens(openaiBody);
       log(`Token estimate: ~${estimatedTokens} (threshold: ${compactionConfig.triggerTokens})`);
 
       if (estimatedTokens >= compactionConfig.triggerTokens) {
@@ -766,6 +801,9 @@ async function handleMessages(req, res) {
       );
       upstream.on("end", () => {
         if (!res.writableEnded) translator.finish(res);
+        // Calibrate from streaming usage
+        const estimatedTokens = estimateTokens(openaiBody);
+        calibrateTokenEstimate(estimatedTokens, translator.usage?.input_tokens);
       });
       upstream.on("error", (e) => {
         log(`Stream error: ${e.message}`);
@@ -776,6 +814,10 @@ async function handleMessages(req, res) {
       for await (const chunk of upstream) respBody += chunk;
       const openaiResp = JSON.parse(respBody);
       const anthropicResp = openAIToAnthropic(openaiResp, requestModel);
+
+      // Calibrate token estimates with actual usage
+      const estimatedTokens = estimateTokens(openaiBody);
+      calibrateTokenEstimate(estimatedTokens, openaiResp.usage?.prompt_tokens);
 
       if (VERBOSE) {
         log(
@@ -870,7 +912,16 @@ server.listen(PORT, "127.0.0.1", async () => {
 
 // ─── Compaction ─────────────────────────────────────────────────────────────
 
-const DEFAULT_COMPACTION_TRIGGER = 150_000;
+// Compaction triggers at ~65-70% of each model's context window
+// Values are in estimated tokens (chars/4 heuristic)
+const MODEL_COMPACTION_TRIGGERS = {
+  "claude-opus-4.6": 130_000,    // 200K context → ~65%
+  "claude-opus-4.5": 130_000,    // 200K context → ~65%
+  "claude-sonnet-4.6": 130_000,  // 200K context → ~65%
+  "claude-sonnet-4.5": 130_000,  // 200K context → ~65%
+  "claude-haiku-4.5": 130_000,   // 200K context → ~65%
+};
+const DEFAULT_COMPACTION_TRIGGER = 100_000;
 const MIN_COMPACTION_TRIGGER = 50_000;
 
 const DEFAULT_COMPACTION_INSTRUCTIONS = `Please provide a detailed summary of the conversation so far. Focus on:
@@ -899,8 +950,22 @@ function extractCompactionConfig(body) {
   };
 }
 
-function estimateTokens(openaiMessages) {
-  return Math.ceil(JSON.stringify(openaiMessages).length / 4);
+function estimateTokens(serialized) {
+  const str = typeof serialized === "string" ? serialized : JSON.stringify(serialized);
+  const raw = Math.ceil(str.length / 4);
+  return Math.ceil(raw * tokenCalibrationRatio);
+}
+
+function calibrateTokenEstimate(estimatedTokens, actualPromptTokens) {
+  if (!actualPromptTokens || actualPromptTokens <= 0) return;
+  const ratio = actualPromptTokens / (estimatedTokens / tokenCalibrationRatio);
+  // Exponential moving average
+  tokenCalibrationSamples++;
+  const alpha = Math.min(0.3, 1 / tokenCalibrationSamples);
+  tokenCalibrationRatio = tokenCalibrationRatio * (1 - alpha) + ratio * alpha;
+  if (VERBOSE) {
+    log(`Token calibration: est=${estimatedTokens} actual=${actualPromptTokens} ratio=${tokenCalibrationRatio.toFixed(3)}`);
+  }
 }
 
 function sendCompactionResponse(res, requestModel, compactionResult, config, isStreaming, originalMessages) {
